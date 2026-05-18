@@ -1,12 +1,10 @@
 # gtab
 
-**English** | [中文](README_CN.md)
-
 `gtab` is a lightweight workspace manager for [Ghostty](https://ghostty.org) on macOS.
 
 Save your current Ghostty window layout as a named workspace. Reopen it later with a single keystroke. That is the whole idea.
 
-<video src="https://github.com/user-attachments/assets/f448994b-5c92-4215-aca7-624b62b50131" autoplay loop muted playsinline></video>
+<video src="https://github.com/user-attachments/assets/beb81b3f-b28f-4b4e-a9d9-21c546a87e0a" autoplay loop muted playsinline></video>
 
 ---
 
