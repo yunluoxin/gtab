@@ -1487,9 +1487,11 @@ impl Theme {
             accent: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            emphasis: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            // Use the terminal's default foreground (no absolute color) plus
+            // weight so emphasized text stays readable on both dark and light
+            // themes. Hardcoding Color::White made it invisible on light
+            // backgrounds such as Ghostty's One Half Light (issue #6).
+            emphasis: Style::default().add_modifier(Modifier::BOLD),
             muted: Style::default().fg(Color::Gray),
             dim: Style::default().fg(Color::DarkGray),
             success: Style::default()
@@ -2824,6 +2826,75 @@ mod tests {
             app.handle_mouse(left_click(1, 1), &env()).unwrap(),
             Action::LaunchWorkspace("beta".to_string())
         );
+    }
+
+    #[test]
+    fn emphasis_style_stays_visible_on_light_backgrounds() {
+        // Regression for issue #6: emphasis previously hardcoded Color::White,
+        // which is invisible on light terminal themes (e.g. One Half Light).
+        // Emphasized text must rely on the terminal's default foreground plus
+        // weight, not an absolute color, so it stays readable on any
+        // background.
+        let theme = Theme::detect();
+        assert_eq!(theme.emphasis.fg, None);
+        assert!(theme.emphasis.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn rendered_tui_uses_visible_foregrounds_on_light_terminals() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Render the real TUI and confirm (1) no cell forces an absolute white
+        // foreground, which is invisible on light themes such as One Half Light
+        // (issue #6), and (2) a non-selected workspace name renders with the
+        // terminal's default foreground plus bold, so it stays readable on any
+        // background.
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
+        let app_env = env();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &app_env))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for cell in buffer.content() {
+            assert_ne!(
+                cell.fg,
+                Color::White,
+                "rendered cell {:?} forces white fg",
+                cell.symbol()
+            );
+        }
+
+        // Locate "[beta]" by matching one cell per column (the UI contains
+        // multi-byte border glyphs, so a byte offset is not a column index).
+        let target: Vec<String> = "[beta]".chars().map(|c| c.to_string()).collect();
+        let width = buffer.area.width;
+        let height = buffer.area.height;
+        let mut checked = false;
+        for y in 0..height {
+            let symbols: Vec<String> = (0..width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            for start in 0..symbols.len().saturating_sub(target.len()) + 1 {
+                if symbols[start..start + target.len()] == target[..] {
+                    for offset in 0..target.len() {
+                        let cell = buffer.cell(((start + offset) as u16, y)).unwrap();
+                        assert_eq!(cell.fg, Color::Reset, "name cell should use default fg");
+                        assert!(
+                            cell.modifier.contains(Modifier::BOLD),
+                            "name cell should be bold"
+                        );
+                    }
+                    checked = true;
+                    break;
+                }
+            }
+            if checked {
+                break;
+            }
+        }
+        assert!(checked, "expected [beta] in rendered output");
     }
 
     #[test]
