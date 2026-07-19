@@ -1862,6 +1862,12 @@ fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme
         return Text::default();
     };
 
+    // Multi-window workspaces (`gtab save --all`) render one section per
+    // window, each listing its tabs with their layout maps.
+    if !workspace.windows.is_empty() {
+        return workspace_windows_preview_text(workspace, width, height, theme);
+    }
+
     if workspace.layout.is_empty() {
         if workspace.tabs.is_empty() {
             return Text::default();
@@ -1873,11 +1879,24 @@ fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut remaining = height as usize;
+
+    push_tab_layout_lines(&workspace.layout, &mut lines, &mut remaining, width, theme);
+
+    Text::from(lines)
+}
+
+fn push_tab_layout_lines(
+    tabs: &[WorkspaceTabLayout],
+    lines: &mut Vec<Line<'static>>,
+    remaining: &mut usize,
+    width: u16,
+    theme: &Theme,
+) {
     let map_height = 5_usize;
     let map_width = (width as usize).max(12);
 
-    for (index, tab) in workspace.layout.iter().enumerate() {
-        if remaining == 0 {
+    for (index, tab) in tabs.iter().enumerate() {
+        if *remaining == 0 {
             break;
         }
 
@@ -1886,24 +1905,48 @@ fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme
             Span::styled(tab.title.clone(), theme.emphasis),
         ]);
         lines.push(header);
-        remaining = remaining.saturating_sub(1);
+        *remaining = remaining.saturating_sub(1);
 
-        if remaining >= map_height {
+        if *remaining >= map_height {
             let rendered = render_tab_layout_ascii(tab, map_width, map_height);
             for row in rendered {
-                if remaining == 0 {
+                if *remaining == 0 {
                     break;
                 }
                 lines.push(Line::from(Span::styled(row, theme.dim)));
-                remaining = remaining.saturating_sub(1);
+                *remaining = remaining.saturating_sub(1);
             }
         }
 
-        if remaining == 0 {
+        if *remaining == 0 {
             break;
         }
         lines.push(Line::default());
+        *remaining = remaining.saturating_sub(1);
+    }
+}
+
+fn workspace_windows_preview_text(
+    workspace: &Workspace,
+    width: u16,
+    height: u16,
+    theme: &Theme,
+) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut remaining = height as usize;
+
+    for (index, tabs) in workspace.windows.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+
+        lines.push(Line::from(Span::styled(
+            format!("Window {}", index + 1),
+            theme.accent,
+        )));
         remaining = remaining.saturating_sub(1);
+
+        push_tab_layout_lines(tabs, &mut lines, &mut remaining, width, theme);
     }
 
     Text::from(lines)
@@ -2765,6 +2808,7 @@ mod tests {
                 working_dir: Some("/tmp/project".to_string()),
             }],
             layout: vec![],
+            windows: vec![],
         }
     }
 
@@ -3327,11 +3371,62 @@ mod tests {
                 },
             ],
             layout: vec![],
+            windows: vec![],
         }]);
 
         let lines = text_lines(workspace_tabs_text(&app, &theme));
 
         assert_eq!(lines, vec!["「api」 「worker」 ".to_string()]);
+    }
+
+    #[test]
+    fn workspace_preview_groups_multi_window_layouts_by_window() {
+        let theme = Theme::detect();
+        let leaf = |wd: &str| WorkspacePaneLayout::Leaf {
+            working_dir: wd.to_string(),
+        };
+        let mut ws = workspace("multi");
+        ws.windows = vec![
+            vec![WorkspaceTabLayout {
+                title: "main".to_string(),
+                root: WorkspacePaneLayout::SplitRight {
+                    left: Box::new(leaf("/tmp/a")),
+                    right: Box::new(leaf("/tmp/b")),
+                },
+            }],
+            vec![WorkspaceTabLayout {
+                title: "solo".to_string(),
+                root: leaf("/tmp/c"),
+            }],
+        ];
+        let app = app(vec![ws]);
+
+        let lines = text_lines(workspace_tabs_preview_text(&app, 40, 40, &theme));
+
+        assert!(lines.iter().any(|line| line.contains("Window 1")));
+        assert!(lines.iter().any(|line| line.contains("Window 2")));
+        assert!(lines.iter().any(|line| line.contains("main")));
+        assert!(lines.iter().any(|line| line.contains("solo")));
+        // The split tab renders its two pane labels inside the ASCII map.
+        assert!(lines.iter().any(|line| line.contains('a') && line.contains('|')));
+    }
+
+    #[test]
+    fn workspace_preview_ignores_layout_for_single_window_workspaces() {
+        let theme = Theme::detect();
+        let mut ws = workspace("single");
+        ws.layout = vec![WorkspaceTabLayout {
+            title: "main".to_string(),
+            root: WorkspacePaneLayout::Leaf {
+                working_dir: "/tmp/a".to_string(),
+            },
+        }];
+        let app = app(vec![ws]);
+
+        let lines = text_lines(workspace_tabs_preview_text(&app, 40, 40, &theme));
+
+        assert!(lines.iter().any(|line| line.contains("main")));
+        assert!(!lines.iter().any(|line| line.contains("Window")));
     }
 
     #[test]
@@ -3353,6 +3448,7 @@ mod tests {
             path: PathBuf::from("/tmp/empty.applescript"),
             tabs: vec![],
             layout: vec![],
+            windows: vec![],
         }]);
 
         let lines = text_lines(workspace_tabs_text(&app, &theme));
@@ -3435,3 +3531,4 @@ mod tests {
         assert_eq!(app.rename_original.as_deref(), Some("docs"));
     }
 }
+

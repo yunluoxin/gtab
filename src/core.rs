@@ -109,6 +109,10 @@ pub struct Workspace {
     pub path: PathBuf,
     pub tabs: Vec<WorkspaceTab>,
     pub layout: Vec<WorkspaceTabLayout>,
+    /// Per-window tab layouts for multi-window workspaces saved via
+    /// `gtab save --all`. Empty for single-window workspaces, whose layout
+    /// lives in `layout` instead.
+    pub windows: Vec<Vec<WorkspaceTabLayout>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,12 +296,17 @@ impl AppEnv {
                 .as_deref()
                 .map(parse_workspace_layout)
                 .unwrap_or_default();
+            let windows = content
+                .as_deref()
+                .map(parse_workspace_window_layouts)
+                .unwrap_or_default();
 
             workspaces.push(Workspace {
                 name: stem.to_string(),
                 path,
                 tabs,
                 layout,
+                windows,
             });
         }
 
@@ -1994,12 +2003,7 @@ fn parse_workspace_layout(script: &str) -> Vec<WorkspaceTabLayout> {
     }
 
     fn parse_set_tab_title(line: &str) -> Option<(String, String)> {
-        let rest = line.strip_prefix("perform action \"set_tab_title:")?;
-        let quoted = format!("\"{rest}");
-        let (title, after_title) = parse_apple_string_prefix(&quoted)?;
-        let after_on = after_title.strip_prefix(" on ")?;
-        let var = after_on.trim();
-        Some((var.to_string(), title))
+        parse_set_tab_title_line(line)
     }
 
     let mut cfg_wd: HashMap<usize, String> = HashMap::new();
@@ -2021,8 +2025,7 @@ fn parse_workspace_layout(script: &str) -> Vec<WorkspaceTabLayout> {
         if let Some(root_var) = parse_root_pane_var(trimmed) {
             let cfg_index = parse_var_index(&root_var).unwrap_or(0);
             let wd = cfg_wd.get(&cfg_index).cloned().unwrap_or_default();
-            let mut nodes = Vec::new();
-            nodes.push(Node::Leaf { wd });
+            let nodes = vec![Node::Leaf { wd }];
             let mut var_to_leaf = HashMap::new();
             var_to_leaf.insert(root_var.clone(), 0);
             tabs.push(TabBuilder {
@@ -2115,6 +2118,237 @@ fn parse_workspace_layout(script: &str) -> Vec<WorkspaceTabLayout> {
         .collect()
 }
 
+/// Parse the tab layouts of each window in a multi-window (`gtab save --all`)
+/// script. Returns an empty vec for single-window scripts. Multi-window
+/// scripts prefix every cfg/pane variable with the window index
+/// (`cfg{w}_{n}`, `p{w}_{n}`), create windows as `win{w}`, and extra tabs as
+/// `newtab{w}_{i}`.
+fn parse_workspace_window_layouts(script: &str) -> Vec<Vec<WorkspaceTabLayout>> {
+    use std::collections::HashMap;
+
+    if !script_has_multiple_windows(script) {
+        return Vec::new();
+    }
+
+    #[derive(Clone, Debug)]
+    enum Node {
+        Leaf { wd: String },
+        SplitRight { left: usize, right: usize },
+        SplitDown { top: usize, bottom: usize },
+    }
+
+    #[derive(Clone, Debug)]
+    struct TabBuilder {
+        root: usize,
+        root_var: String,
+        title: Option<String>,
+        nodes: Vec<Node>,
+        var_to_leaf: HashMap<String, usize>,
+    }
+
+    // Strip the `p`/`cfg` prefix and split `{window}_{counter}` (multi-window)
+    // or fall back to a bare `{counter}` with window 1 (defensive; mixed
+    // naming shouldn't occur in generated scripts).
+    fn parse_prefixed_var(var: &str, prefix: &str) -> Option<(usize, usize)> {
+        let rest = var.strip_prefix(prefix)?;
+        let digits_pos = rest.find(|ch: char| ch.is_ascii_digit())?;
+        let rest = &rest[digits_pos..];
+        let (index, tail) = split_digits(rest)?;
+        match tail.strip_prefix('_') {
+            Some(tail) => {
+                let (counter, _) = split_digits(tail)?;
+                Some((index, counter))
+            }
+            None => Some((1, index)),
+        }
+    }
+
+    // Returns (window_index, pane_var) for lines starting a tab's root pane:
+    //   set p{w}_{n} to focused terminal of selected tab of win{w}
+    //   set p{w}_{n} to focused terminal of newtab{w}_{i}
+    fn parse_multi_root_pane_var(line: &str) -> Option<(usize, String)> {
+        let rest = line.strip_prefix("set ")?;
+        let (var, after) = rest.split_once(" to focused terminal of ")?;
+        let var = var.trim();
+        let (window_index, _) = parse_prefixed_var(var, "p")?;
+        let after = after.trim();
+        let is_root = after
+            .strip_prefix("selected tab of ")
+            .and_then(|w| w.strip_prefix("win"))
+            .and_then(|w| split_digits(w).map(|(w, _)| w == window_index))
+            .unwrap_or(false)
+            || after
+                .strip_prefix("newtab")
+                .and_then(|w| split_digits(w).map(|(w, _)| w == window_index))
+                .unwrap_or(false);
+        is_root.then(|| (window_index, var.to_string()))
+    }
+
+    // set p{w}_{new} to split p{w}_{target} direction right|down with configuration cfg{w}_{idx}
+    fn parse_multi_split(line: &str) -> Option<(String, String, bool, usize, usize)> {
+        let rest = line.strip_prefix("set ")?;
+        let (new_var, rest) = rest.split_once(" to split ")?;
+        let (target_var, rest) = rest.split_once(" direction ")?;
+        let (dir, rest) = rest.split_once(" with configuration ")?;
+        let (cfg_window, cfg_index) = parse_prefixed_var(rest.trim(), "cfg")?;
+        let (var_window, _) = parse_prefixed_var(new_var.trim(), "p")?;
+        if var_window != cfg_window {
+            return None;
+        }
+        let is_right = match dir.trim() {
+            "right" => true,
+            "down" => false,
+            _ => return None,
+        };
+        Some((
+            new_var.trim().to_string(),
+            target_var.trim().to_string(),
+            is_right,
+            var_window,
+            cfg_index,
+        ))
+    }
+
+    // Keyed by (window_index, cfg_counter).
+    let mut cfg_wd: HashMap<(usize, usize), String> = HashMap::new();
+    for line in script.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("set initial working directory of ") else {
+            continue;
+        };
+        let Some((var, value)) = rest.split_once(" to ") else {
+            continue;
+        };
+        let Some(key) = parse_prefixed_var(var.trim(), "cfg") else {
+            continue;
+        };
+        if let Some(wd) = parse_apple_string(value) {
+            cfg_wd.insert(key, wd);
+        }
+    }
+
+    let mut windows: Vec<Vec<TabBuilder>> = Vec::new();
+    let mut current_tab: Option<(usize, usize)> = None; // (window, tab-in-window)
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+
+        if let Some((window_index, root_var)) = parse_multi_root_pane_var(trimmed) {
+            let (_, counter) = parse_prefixed_var(&root_var, "p").unwrap_or((window_index, 0));
+            let wd = cfg_wd
+                .get(&(window_index, counter))
+                .cloned()
+                .unwrap_or_default();
+            while windows.len() < window_index {
+                windows.push(Vec::new());
+            }
+            let window_tabs = &mut windows[window_index - 1];
+            let mut var_to_leaf = HashMap::new();
+            var_to_leaf.insert(root_var.clone(), 0);
+            window_tabs.push(TabBuilder {
+                root: 0,
+                root_var,
+                title: None,
+                nodes: vec![Node::Leaf { wd }],
+                var_to_leaf,
+            });
+            current_tab = Some((window_index, window_tabs.len() - 1));
+            continue;
+        }
+
+        let Some((window_index, tab_index)) = current_tab else {
+            continue;
+        };
+
+        if let Some((var, title)) = parse_set_tab_title_line(trimmed) {
+            let tab = &mut windows[window_index - 1][tab_index];
+            if var == tab.root_var {
+                tab.title = Some(title);
+            }
+            continue;
+        }
+
+        if let Some((new_var, target_var, is_right, split_window, cfg_index)) =
+            parse_multi_split(trimmed)
+        {
+            if split_window != window_index {
+                continue;
+            }
+            let tab = &mut windows[window_index - 1][tab_index];
+            let Some(&target_leaf) = tab.var_to_leaf.get(&target_var) else {
+                continue;
+            };
+            let target_wd = match &tab.nodes[target_leaf] {
+                Node::Leaf { wd } => wd.clone(),
+                _ => continue,
+            };
+            let new_wd = cfg_wd
+                .get(&(split_window, cfg_index))
+                .cloned()
+                .unwrap_or_default();
+            let left_or_top = tab.nodes.len();
+            tab.nodes.push(Node::Leaf { wd: target_wd });
+            let right_or_bottom = tab.nodes.len();
+            tab.nodes.push(Node::Leaf { wd: new_wd });
+            tab.nodes[target_leaf] = if is_right {
+                Node::SplitRight {
+                    left: left_or_top,
+                    right: right_or_bottom,
+                }
+            } else {
+                Node::SplitDown {
+                    top: left_or_top,
+                    bottom: right_or_bottom,
+                }
+            };
+            // After a split, the original variable still refers to the original pane.
+            tab.var_to_leaf.insert(target_var, left_or_top);
+            tab.var_to_leaf.insert(new_var, right_or_bottom);
+        }
+    }
+
+    fn build_layout(nodes: &[Node], index: usize) -> WorkspacePaneLayout {
+        match &nodes[index] {
+            Node::Leaf { wd } => WorkspacePaneLayout::Leaf {
+                working_dir: wd.clone(),
+            },
+            Node::SplitRight { left, right } => WorkspacePaneLayout::SplitRight {
+                left: Box::new(build_layout(nodes, *left)),
+                right: Box::new(build_layout(nodes, *right)),
+            },
+            Node::SplitDown { top, bottom } => WorkspacePaneLayout::SplitDown {
+                top: Box::new(build_layout(nodes, *top)),
+                bottom: Box::new(build_layout(nodes, *bottom)),
+            },
+        }
+    }
+
+    windows
+        .into_iter()
+        .map(|tabs| {
+            tabs.into_iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    let root_wd =
+                        tab.var_to_leaf
+                            .get(&tab.root_var)
+                            .and_then(|leaf| match &tab.nodes[*leaf] {
+                                Node::Leaf { wd } => Some(wd.as_str()),
+                                _ => None,
+                            });
+                    WorkspaceTabLayout {
+                        title: tab
+                            .title
+                            .filter(|title| !title.is_empty())
+                            .unwrap_or_else(|| fallback_tab_name(index + 1, root_wd)),
+                        root: build_layout(&tab.nodes, tab.root),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn parsed_workspace_tabs(script: &str) -> Vec<ParsedWorkspaceTab> {
     let mut tabs: Vec<ParsedWorkspaceTab> = Vec::new();
 
@@ -2152,6 +2386,15 @@ fn parse_indexed_assignment(line: &str, prefix: &str, marker: &str) -> Option<(u
     let (index, rest) = split_digits(rest)?;
     let value = rest.strip_prefix(marker)?;
     parse_apple_string(value).map(|parsed| (index, parsed))
+}
+
+fn parse_set_tab_title_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("perform action \"set_tab_title:")?;
+    let quoted = format!("\"{rest}");
+    let (title, after_title) = parse_apple_string_prefix(&quoted)?;
+    let after_on = after_title.strip_prefix(" on ")?;
+    let var = after_on.trim();
+    Some((var.to_string(), title))
 }
 
 fn parse_title_assignment(line: &str) -> Option<(usize, String)> {
@@ -2560,10 +2803,11 @@ mod tests {
     use super::{
         AppEnv, CapturedPaneRect, CapturedTabSurface, CapturedWindow, CapturedWorkspace, Config,
         GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode,
-        apple_escape, build_ghostty_cd_script, build_ghostty_replace_directory_script,
-        build_ghostty_shortcut_include, build_restore_script, build_workspace_script,
-        format_workspace_list, looks_like_shell_default_title, normalize_captured_tab_title,
-        parse_captured_window_frames, parse_window_frame, parse_workspace_rows,
+        WorkspacePaneLayout, apple_escape, build_ghostty_cd_script,
+        build_ghostty_replace_directory_script, build_ghostty_shortcut_include,
+        build_restore_script, build_workspace_script, format_workspace_list,
+        looks_like_shell_default_title, normalize_captured_tab_title, parse_captured_window_frames,
+        parse_window_frame, parse_workspace_rows, parse_workspace_window_layouts,
         parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
         render_ghostty_include_config_line, render_shell_cd_command, script_has_multiple_windows,
         should_switch_to_ascii_input_source, sync_ghostty_include_reference,
@@ -2689,6 +2933,81 @@ mod tests {
         assert!(script.contains("set cfg2_2 to new surface configuration"));
         assert!(script.contains("set initial working directory of cfg2_2 to \"/tmp/right\""));
         assert!(script.contains("split p2_1 direction right with configuration cfg2_2"));
+    }
+
+    #[test]
+    fn parse_workspace_window_layouts_round_trips_multi_window_script() {
+        let mut left = captured_surface(1, 1, "/tmp/left");
+        left.pane_index = 1;
+        left.rect = CapturedPaneRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
+        let mut right = captured_surface(1, 1, "/tmp/right");
+        right.pane_index = 2;
+        right.rect = CapturedPaneRect {
+            x: 100,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
+
+        let workspace = CapturedWorkspace {
+            windows: vec![
+                CapturedWindow {
+                    window_index: 1,
+                    frame: WindowFrame::new(0, 0, 100, 100),
+                },
+                CapturedWindow {
+                    window_index: 2,
+                    frame: WindowFrame::new(0, 0, 200, 200),
+                },
+            ],
+            surfaces: vec![left, right, captured_surface(2, 1, "/tmp/solo")],
+        };
+        let script = build_restore_script(&workspace).unwrap();
+
+        let windows = parse_workspace_window_layouts(&script);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].len(), 1);
+        assert_eq!(windows[1].len(), 1);
+
+        // Window 1's tab splits into left | right.
+        match &windows[0][0].root {
+            WorkspacePaneLayout::SplitRight { left, right } => {
+                assert!(matches!(
+                    left.as_ref(),
+                    WorkspacePaneLayout::Leaf { working_dir } if working_dir == "/tmp/left"
+                ));
+                assert!(matches!(
+                    right.as_ref(),
+                    WorkspacePaneLayout::Leaf { working_dir } if working_dir == "/tmp/right"
+                ));
+            }
+            other => panic!("expected SplitRight, got {other:?}"),
+        }
+
+        // Window 2's tab is a single pane.
+        assert!(matches!(
+            &windows[1][0].root,
+            WorkspacePaneLayout::Leaf { working_dir } if working_dir == "/tmp/solo"
+        ));
+    }
+
+    #[test]
+    fn parse_workspace_window_layouts_ignores_single_window_scripts() {
+        let workspace = CapturedWorkspace {
+            windows: vec![CapturedWindow {
+                window_index: 1,
+                frame: WindowFrame::new(0, 0, 100, 100),
+            }],
+            surfaces: vec![captured_surface(1, 1, "/tmp/one")],
+        };
+        let script = build_restore_script(&workspace).unwrap();
+
+        assert!(parse_workspace_window_layouts(&script).is_empty());
     }
 
     #[test]
@@ -3593,6 +3912,7 @@ end tell"#;
             path: PathBuf::from(format!("/tmp/{name}.applescript")),
             tabs: vec![],
             layout: vec![],
+            windows: vec![],
         }
     }
 
@@ -3605,3 +3925,4 @@ end tell"#;
         }
     }
 }
+
