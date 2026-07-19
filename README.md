@@ -118,6 +118,8 @@ gtab() {
 gtab                     Open the TUI
 gtab init                Enable the Ghostty-local Cmd+G shortcut
 gtab save <name>         Save the current Ghostty window
+gtab save <name> --all   Save every open Ghostty window (tabs, splits, and
+                         window frames) as one workspace
 gtab <name>              Launch a workspace directly
 gtab list                List saved workspaces
 gtab rename <old> <new>  Rename a workspace
@@ -223,6 +225,8 @@ After that, rebuild/apply your config and reload or restart Ghostty.
 ## How It Works
 
 `gtab save` reads the current Ghostty window through Ghostty's AppleScript API. For split-pane tabs, it also queries macOS Accessibility to capture pane positions, then reconstructs the split tree. The result is a plain `.applescript` file stored in `~/.config/gtab/`.
+
+`gtab save --all` does the same for every open Ghostty window: each window is briefly brought to the front one at a time so its split geometry can be captured, along with the window's position and size. Launching recreates all windows and restores each window's frame via Ghostty's `set_frame` action. With only one window open, `--all` saves exactly the same script as a plain `gtab save`.
 
 Launching a workspace runs that script via `osascript` to open a fresh Ghostty window and recreate the saved layout.
 

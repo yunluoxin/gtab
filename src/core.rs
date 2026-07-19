@@ -125,6 +125,17 @@ pub struct WindowFrame {
     pub height: i32,
 }
 
+impl WindowFrame {
+    fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ShortcutLauncherInputSourceGuard {
     #[cfg(target_os = "macos")]
@@ -164,6 +175,8 @@ enum WorkspaceLaunchMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapturedTabSurface {
+    /// 1-based Ghostty window index. Always 1 for single-window captures.
+    window_index: usize,
     tab_index: usize,
     pane_index: usize,
     terminal_id: String,
@@ -178,6 +191,35 @@ struct CapturedPaneRect {
     y: i32,
     width: i32,
     height: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedWindow {
+    /// 1-based index matching `CapturedTabSurface::window_index`.
+    window_index: usize,
+    frame: WindowFrame,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedWorkspace {
+    windows: Vec<CapturedWindow>,
+    surfaces: Vec<CapturedTabSurface>,
+}
+
+impl CapturedWorkspace {
+    fn single_window(surfaces: Vec<CapturedTabSurface>) -> Self {
+        Self {
+            windows: vec![CapturedWindow {
+                window_index: 1,
+                frame: WindowFrame::new(0, 0, 0, 0),
+            }],
+            surfaces,
+        }
+    }
+
+    fn is_multi_window(&self) -> bool {
+        self.windows.len() > 1
+    }
 }
 
 impl AppEnv {
@@ -316,6 +358,21 @@ impl AppEnv {
     pub fn save_current_window(&self, name: &str) -> Result<PathBuf> {
         let path = self.workspace_path(name)?;
         let script = capture_workspace_script()?;
+        fs::write(&path, &script).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Save every open Ghostty window (tabs, splits, working directories,
+    /// titles, and window frames) as one workspace. Falls back to the
+    /// single-window capture when only one window is open so the saved
+    /// script keeps the legacy shape and TUI frame-sync behavior.
+    pub fn save_all_windows(&self, name: &str) -> Result<PathBuf> {
+        let path = self.workspace_path(name)?;
+        let script = if ghostty_window_count()? <= 1 {
+            capture_workspace_script()?
+        } else {
+            capture_all_windows_script()?
+        };
         fs::write(&path, &script).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
@@ -492,6 +549,14 @@ impl AppEnv {
                 Ok(Some(LAUNCH_WARNING_UNSUPPORTED_CUSTOM_CONFIG.to_string()))
             }
             WorkspaceLaunchMode::DirectSplit => {
+                if script_has_multiple_windows(&script) {
+                    // Multi-window workspaces restore each window's own frame
+                    // from inside the script; applying the caller's frame to a
+                    // single window would be wrong.
+                    self.launch_workspace_script_path(&path)?;
+                    self.finish_workspace_launch()?;
+                    return Ok(None);
+                }
                 let existing_window_ids = ghostty_window_ids()?;
                 self.launch_workspace_script_path(&path)?;
                 if let Ok(window_id) = wait_for_new_ghostty_window_id(&existing_window_ids) {
@@ -1071,16 +1136,237 @@ end tell"#,
         bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
 
-    let captured = parse_captured_tab_surfaces(&raw);
+    let captured = parse_captured_tab_surfaces(&raw, 1);
     if captured.is_empty() {
         bail!("could not parse Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
 
-    let normalized = serialize_captured_tab_surfaces(&captured);
+    build_restore_script(&CapturedWorkspace::single_window(captured))
+}
+
+/// Capture every open Ghostty window (tabs, splits, working directories,
+/// titles) along with each window's frame, then render a restore script that
+/// recreates all windows. Windows are briefly brought to the front one at a
+/// time so split-pane geometry can be read via the Accessibility API.
+fn capture_all_windows_script() -> Result<String> {
+    // Phase 1: enumerate windows; front each one to capture tab/pane data and
+    // AX pane positions, plus the window frame. Restores the previously
+    // frontmost window when done.
+    // Ghostty's AppleScript dictionary has no raise/bring-to-front verb, so
+    // each window is fronted through the Accessibility API instead:
+    // AXChildren of the process lists every window (each may appear twice;
+    // AXMain dedupes), AXRaise fronts the target, and the window is matched
+    // back to its AppleScript index via the AX window title, which equals
+    // the selected tab's name. While a window is frontmost its frame and
+    // pane geometry are captured, then the previously front window is
+    // restored.
+    let raw = run_osascript(
+        r#"set D to (ASCII character 9)
+set frameLines to {}
+set allLines to {}
+tell application "Ghostty"
+  set winCount to count of windows
+  if winCount is 0 then error "Ghostty has no open window"
+  -- remember the terminal that invoked the capture so focus can be restored
+  set callerId to id of focused terminal of selected tab of front window
+end tell
+tell application "System Events"
+  tell process "Ghostty"
+    set prevWin to value of attribute "AXMainWindow"
+  end tell
+end tell
+repeat with wi from 1 to winCount
+  tell application "Ghostty"
+    activate
+    set selName to name of selected tab of window wi
+  end tell
+  tell application "System Events"
+    tell process "Ghostty"
+      set targetWin to missing value
+      set axKids to value of attribute "AXChildren"
+      repeat with k in axKids
+        try
+          if role of k is "AXWindow" then
+            if (value of attribute "AXMain" of k) is false then
+              if name of k is selName then
+                set targetWin to k
+                exit repeat
+              end if
+            end if
+          end if
+        end try
+      end repeat
+      if targetWin is not missing value then
+        perform action "AXRaise" of targetWin
+        delay 0.3
+      end if
+      set axMain to value of attribute "AXMainWindow"
+      if axMain is not missing value then
+        if name of axMain is selName then
+          set {xPos, yPos} to value of attribute "AXPosition" of axMain
+          set {winWidth, winHeight} to value of attribute "AXSize" of axMain
+          set end of frameLines to (wi as text) & D & (xPos as text) & D & (yPos as text) & D & (winWidth as text) & D & (winHeight as text)
+        end if
+      end if
+    end tell
+  end tell
+  tell application "Ghostty"
+    set win to window wi
+    set tabList to tabs of win
+    repeat with ti from 1 to count of tabList
+      set t to item ti of tabList
+      set termList to every terminal of t
+      set ttl to name of t
+      if (count of termList) = 1 then
+        set term to item 1 of termList
+        set wd to working directory of term
+        if wd = "" then set wd to POSIX path of (path to home folder)
+        set end of allLines to (wi as text) & D & (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1"
+      else
+        repeat with pi from 1 to count of termList
+          set term to item pi of termList
+          set wd to working directory of term
+          if wd = "" then set wd to POSIX path of (path to home folder)
+          focus term
+          delay 0.12
+          set posStr to "0,0,1,1"
+          tell application "System Events"
+            try
+              set gProc to application process "Ghostty"
+              set fe to value of attribute "AXFocusedUIElement" of gProc
+              repeat 8 times
+                if role of fe = "AXScrollArea" then exit repeat
+                set fe to value of attribute "AXParent" of fe
+              end repeat
+              set pos to position of fe
+              set sz to size of fe
+              set posStr to ((item 1 of pos) as text) & "," & ((item 2 of pos) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
+            end try
+          end tell
+          set end of allLines to (wi as text) & D & (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr
+        end repeat
+      end if
+    end repeat
+  end tell
+end repeat
+tell application "System Events"
+  tell process "Ghostty"
+    try
+      if prevWin is not missing value then
+        perform action "AXRaise" of prevWin
+      end if
+    end try
+  end tell
+end tell
+tell application "Ghostty"
+  -- return focus to the terminal that invoked the capture
+  try
+    set focusDone to false
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with tm in (every terminal of tb)
+          if (id of tm) is callerId then
+            focus tm
+            set focusDone to true
+            exit repeat
+          end if
+        end repeat
+        if focusDone then exit repeat
+      end repeat
+      if focusDone then exit repeat
+    end repeat
+  end try
+end tell
+set AppleScript's text item delimiters to linefeed
+set frameText to frameLines as text
+set rowText to allLines as text
+set AppleScript's text item delimiters to ""
+return frameText & linefeed & "@@SURFACES@@" & linefeed & rowText"#,
+    )
+    .context("could not read Ghostty windows (make sure Ghostty is running)")?;
+
+    let Some((frame_section, surface_section)) = raw.split_once("@@SURFACES@@") else {
+        bail!("could not parse Ghostty windows (unexpected capture output)");
+    };
+
+    let windows = parse_captured_window_frames(frame_section);
+    if windows.is_empty() {
+        bail!("could not read Ghostty window frames (check Accessibility permissions)");
+    }
+
+    let mut captured = Vec::new();
+    for line in surface_section.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let Some((window_index, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(window_index) = window_index.trim().parse::<usize>() else {
+            continue;
+        };
+        if let Some(surface) = parse_captured_tab_surface(rest, window_index) {
+            captured.push(surface);
+        }
+    }
+    if captured.is_empty() {
+        bail!("could not parse Ghostty tabs (make sure Ghostty is running)");
+    }
+
+    build_restore_script(&CapturedWorkspace {
+        windows,
+        surfaces: captured,
+    })
+}
+
+fn parse_captured_window_frames(section: &str) -> Vec<CapturedWindow> {
+    section
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim_end_matches('\r').split('\t');
+            let window_index = parts.next()?.trim().parse().ok()?;
+            let x = parts.next()?.trim().parse().ok()?;
+            let y = parts.next()?.trim().parse().ok()?;
+            let width = parts.next()?.trim().parse().ok()?;
+            let height = parts.next()?.trim().parse().ok()?;
+            Some(CapturedWindow {
+                window_index,
+                frame: WindowFrame::new(x, y, width, height),
+            })
+        })
+        .collect()
+}
+
+/// Reconstruct split trees from captured pane geometry and render the
+/// AppleScript that recreates the workspace. Single-window workspaces keep
+/// the legacy script shape (plain `cfg1`/`cfg2`... indexes, `win` variable)
+/// so existing launch/parse logic keeps working; multi-window workspaces use
+/// per-window `cfgW_T` indexes, one window variable per window, and restore
+/// each window's frame through Ghostty's `set_frame` action.
+fn build_restore_script(workspace: &CapturedWorkspace) -> Result<String> {
+    let normalized = serialize_captured_tab_surfaces(&workspace.surfaces);
+    let multi = workspace.is_multi_window();
+    let frames: Vec<(usize, i32, i32, i32, i32)> = workspace
+        .windows
+        .iter()
+        .map(|window| {
+            (
+                window.window_index,
+                window.frame.x,
+                window.frame.y,
+                window.frame.width,
+                window.frame.height,
+            )
+        })
+        .collect();
 
     // Phase 2: reconstruct split trees from positions and generate restore script
     let py = r#"import sys
 from collections import defaultdict
+
+MULTI = __MULTI__
+FRAMES = {wi: (x, y, w, h) for wi, x, y, w, h in __FRAMES__}
 
 def esc(s):
     return s.replace('\\', '\\\\').replace('"', '\\"')
@@ -1105,71 +1391,97 @@ def reconstruct(panes):
             return {'t': 'h', 'T': reconstruct(T), 'B': reconstruct(B)}
     return {'t': 'leaf', 'p': panes[0]}
 
-def gen(tree, var, lines, c):
-    if tree['t'] == 'leaf': return c
+def gen(tree, var, lines, cv, c):
+    if tree['t'] == 'leaf': return cv, c
+    # Single-window workspaces keep legacy `cfg{c}` variable names so the
+    # launch/parse logic built for pre---all scripts keeps working.
+    pfx = f"{cv}_" if MULTI else ""
     if tree['t'] == 'v':
         a = get_anchor(tree['r'])
+        cfg = f"cfg{pfx}{c}"
         lines += [
             '',
-            f"    set cfg{c} to new surface configuration",
-            f'    set initial working directory of cfg{c} to "{esc(a["wd"])}"',
-            f"    set p{c} to split {var} direction right with configuration cfg{c}"
+            f"    set {cfg} to new surface configuration",
+            f'    set initial working directory of {cfg} to "{esc(a["wd"])}"',
+            f"    set p{pfx}{c} to split {var} direction right with configuration {cfg}"
         ]
-        rv, c = f"p{c}", c + 1
-        c = gen(tree['l'], var, lines, c)
-        c = gen(tree['r'], rv, lines, c)
+        rv, c = f"p{pfx}{c}", c + 1
+        cv, c = gen(tree['l'], var, lines, cv, c)
+        cv, c = gen(tree['r'], rv, lines, cv, c)
     else:
         a = get_anchor(tree['B'])
+        cfg = f"cfg{pfx}{c}"
         lines += [
             '',
-            f"    set cfg{c} to new surface configuration",
-            f'    set initial working directory of cfg{c} to "{esc(a["wd"])}"',
-            f"    set p{c} to split {var} direction down with configuration cfg{c}"
+            f"    set {cfg} to new surface configuration",
+            f'    set initial working directory of {cfg} to "{esc(a["wd"])}"',
+            f"    set p{pfx}{c} to split {var} direction down with configuration {cfg}"
         ]
-        bv, c = f"p{c}", c + 1
-        c = gen(tree['T'], var, lines, c)
-        c = gen(tree['B'], bv, lines, c)
-    return c
+        bv, c = f"p{pfx}{c}", c + 1
+        cv, c = gen(tree['T'], var, lines, cv, c)
+        cv, c = gen(tree['B'], bv, lines, cv, c)
+    return cv, c
 
-tabs = defaultdict(lambda: {'title': '', 'panes': []})
+windows = defaultdict(lambda: defaultdict(lambda: {'title': '', 'panes': []}))
 for line in sys.stdin:
     parts = line.rstrip('\n').split('\t')
-    if len(parts) < 6: continue
-    ti, wd, title, pos = int(parts[0]), parts[3], parts[4], parts[5]
+    if len(parts) < 7: continue
+    try: wi, ti = int(parts[0]), int(parts[1])
+    except ValueError: continue
+    wd, title, pos = parts[4], parts[5], parts[6]
     try: x, y, w, h = map(int, pos.split(','))
     except ValueError: x, y, w, h = 0, 0, 1, 1
-    tabs[ti]['title'] = title
-    tabs[ti]['panes'].append({'x': x, 'y': y, 'w': w, 'h': h, 'wd': wd})
+    windows[wi][ti]['title'] = title
+    windows[wi][ti]['panes'].append({'x': x, 'y': y, 'w': w, 'h': h, 'wd': wd})
 
 out = ['tell application "Ghostty"', '    activate']
-c = 1
-for i, ti in enumerate(sorted(tabs.keys())):
-    tab = tabs[ti]
-    tree = reconstruct(tab['panes'])
-    anchor = get_anchor(tree)
-    out += [
-        '',
-        f"    set cfg{c} to new surface configuration",
-        f'    set initial working directory of cfg{c} to "{esc(anchor["wd"])}"'
-    ]
-    if i == 0:
+for wi in sorted(windows.keys()):
+    tabs = windows[wi]
+    cv = wi if MULTI else 1
+    wv = f"win{wi}" if MULTI else "win"
+    pfx = f"{cv}_" if MULTI else ""
+    c = 1
+    for i, ti in enumerate(sorted(tabs.keys())):
+        tab = tabs[ti]
+        tree = reconstruct(tab['panes'])
+        anchor = get_anchor(tree)
+        cfg = f"cfg{pfx}{c}"
         out += [
-            f"    set win to new window with configuration cfg{c}",
-            f"    set p{c} to focused terminal of selected tab of win"
+            '',
+            f"    set {cfg} to new surface configuration",
+            f'    set initial working directory of {cfg} to "{esc(anchor["wd"])}"'
         ]
-    else:
+        if i == 0:
+            out += [
+                f"    set {wv} to new window with configuration {cfg}",
+                f"    set p{pfx}{c} to focused terminal of selected tab of {wv}"
+            ]
+        else:
+            out += [
+                f"    set newtab{cv}_{i} to new tab in {wv} with configuration {cfg}",
+                f"    set p{pfx}{c} to focused terminal of newtab{cv}_{i}"
+            ]
+        fv, c = f"p{pfx}{c}", c + 1
+        if tab['title']:
+            out.append(f'    perform action "set_tab_title:{esc(tab["title"])}" on {fv}')
+        cv, c = gen(tree, fv, out, cv, c)
+    if MULTI and wi in FRAMES:
+        fx, fy, fw, fh = FRAMES[wi]
+        # set_frame needs a terminal target (a window target errors with
+        # "Missing terminal target"); the first pane of the window works.
         out += [
-            f"    set newtab{i} to new tab in win with configuration cfg{c}",
-            f"    set p{c} to focused terminal of newtab{i}"
+            '',
+            f'    perform action "set_frame:{fx},{fy},{fw},{fh}" on p{pfx}1'
         ]
-    fv, c = f"p{c}", c + 1
-    if tab['title']:
-        out.append(f'    perform action "set_tab_title:{esc(tab["title"])}" on {fv}')
-    c = gen(tree, fv, out, c)
 
 out.append('end tell')
-print('\n'.join(out))
+header = f"-- gtab: format=2 windows={len(windows)}"
+print(header + '\n' + '\n'.join(out))
 "#;
+
+    let py = py
+        .replace("__MULTI__", if multi { "True" } else { "False" })
+        .replace("__FRAMES__", &format!("{frames:?}"));
 
     let mut child = Command::new("python3")
         .arg("-c")
@@ -1202,11 +1514,13 @@ print('\n'.join(out))
     String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
 }
 
-fn parse_captured_tab_surfaces(raw: &str) -> Vec<CapturedTabSurface> {
-    raw.lines().filter_map(parse_captured_tab_surface).collect()
+fn parse_captured_tab_surfaces(raw: &str, window_index: usize) -> Vec<CapturedTabSurface> {
+    raw.lines()
+        .filter_map(|line| parse_captured_tab_surface(line, window_index))
+        .collect()
 }
 
-fn parse_captured_tab_surface(line: &str) -> Option<CapturedTabSurface> {
+fn parse_captured_tab_surface(line: &str, window_index: usize) -> Option<CapturedTabSurface> {
     let mut parts = line.split('\t');
     let tab_index = parts.next()?.trim().parse().ok()?;
     let pane_index = parts.next()?.trim().parse().ok()?;
@@ -1215,6 +1529,7 @@ fn parse_captured_tab_surface(line: &str) -> Option<CapturedTabSurface> {
     let title = normalize_captured_tab_title(parts.next()?);
     let rect = parse_captured_pane_rect(parts.next()?)?;
     Some(CapturedTabSurface {
+        window_index,
         tab_index,
         pane_index,
         terminal_id,
@@ -1247,6 +1562,8 @@ fn serialize_captured_tab_surfaces(rows: &[CapturedTabSurface]) -> String {
             out.push('\n');
         }
 
+        out.push_str(&row.window_index.to_string());
+        out.push('\t');
         out.push_str(&row.tab_index.to_string());
         out.push('\t');
         out.push_str(&row.pane_index.to_string());
@@ -1407,8 +1724,26 @@ end tell"#,
     Ok(())
 }
 
-fn ghostty_window_ids() -> Result<BTreeSet<String>> {
-    let output = run_osascript(
+fn ghostty_window_count() -> Result<usize> {
+    Ok(ghostty_window_ids()?.len())
+}
+
+/// Multi-window workspaces saved via `gtab save --all` carry a
+/// `-- gtab: format=2 windows=N` header.
+fn script_has_multiple_windows(script: &str) -> bool {
+    script.lines().take(3).any(|line| {
+        let line = line.trim();
+        line.strip_prefix("-- gtab:")
+            .and_then(|rest| {
+                rest.split_whitespace()
+                    .find_map(|token| token.strip_prefix("windows="))
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|count| count > 1)
+    })
+}
+
+fn ghostty_window_ids() -> Result<BTreeSet<String>> {    let output = run_osascript(
         r#"set rows to {}
 tell application "Ghostty"
   repeat with win in windows
@@ -2176,13 +2511,14 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame,
-        WorkspaceLaunchMode, apple_escape, build_ghostty_cd_script,
-        build_ghostty_replace_directory_script, build_ghostty_shortcut_include,
-        build_workspace_script, format_workspace_list, looks_like_shell_default_title,
-        normalize_captured_tab_title, parse_window_frame, parse_workspace_rows,
+        AppEnv, CapturedPaneRect, CapturedTabSurface, CapturedWindow, CapturedWorkspace, Config,
+        GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode,
+        apple_escape, build_ghostty_cd_script, build_ghostty_replace_directory_script,
+        build_ghostty_shortcut_include, build_restore_script, build_workspace_script,
+        format_workspace_list, looks_like_shell_default_title, normalize_captured_tab_title,
+        parse_captured_window_frames, parse_window_frame, parse_workspace_rows,
         parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
-        render_ghostty_include_config_line, render_shell_cd_command,
+        render_ghostty_include_config_line, render_shell_cd_command, script_has_multiple_windows,
         should_switch_to_ascii_input_source, sync_ghostty_include_reference,
         validate_workspace_name, workspace_requires_true_legacy_launch,
     };
@@ -2199,6 +2535,144 @@ mod tests {
             base_dir,
             config: Config::default(),
         }
+    }
+
+    fn captured_surface(window: usize, tab: usize, wd: &str) -> CapturedTabSurface {
+        CapturedTabSurface {
+            window_index: window,
+            tab_index: tab,
+            pane_index: 1,
+            terminal_id: format!("term-{window}-{tab}"),
+            working_dir: wd.to_string(),
+            title: String::new(),
+            rect: CapturedPaneRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn build_restore_script_single_window_keeps_legacy_shape() {
+        let workspace = CapturedWorkspace::single_window(vec![
+            captured_surface(1, 1, "/tmp/one"),
+            captured_surface(1, 2, "/tmp/two"),
+        ]);
+        let script = build_restore_script(&workspace).unwrap();
+
+        assert!(script.starts_with("-- gtab: format=2 windows=1\n"));
+        assert!(script.contains("set cfg1 to new surface configuration"));
+        assert!(script.contains("set cfg2 to new surface configuration"));
+        assert!(script.contains("set win to new window with configuration cfg1"));
+        assert!(script.contains("set newtab1_1 to new tab in win with configuration cfg2"));
+        assert!(!script.contains("set_frame:"));
+        assert!(!script_has_multiple_windows(&script));
+        // Legacy parsers still see both tabs.
+        assert_eq!(parse_workspace_rows(&script).len(), 2);
+    }
+
+    #[test]
+    fn build_restore_script_multi_window_uses_per_window_vars_and_frames() {
+        let workspace = CapturedWorkspace {
+            windows: vec![
+                CapturedWindow {
+                    window_index: 1,
+                    frame: WindowFrame::new(10, 20, 800, 600),
+                },
+                CapturedWindow {
+                    window_index: 2,
+                    frame: WindowFrame::new(-500, 40, 1024, 768),
+                },
+            ],
+            surfaces: vec![
+                captured_surface(1, 1, "/tmp/one"),
+                captured_surface(2, 1, "/tmp/two"),
+                captured_surface(2, 2, "/tmp/three"),
+            ],
+        };
+        let script = build_restore_script(&workspace).unwrap();
+
+        assert!(script.starts_with("-- gtab: format=2 windows=2\n"));
+        assert!(script.contains("set win1 to new window with configuration cfg1_1"));
+        assert!(script.contains("set win2 to new window with configuration cfg2_1"));
+        assert!(script.contains("set newtab2_1 to new tab in win2 with configuration cfg2_2"));
+        assert!(script.contains("set initial working directory of cfg2_2 to \"/tmp/three\""));
+        assert!(script.contains("perform action \"set_frame:10,20,800,600\" on p1_1"));
+        assert!(script.contains("perform action \"set_frame:-500,40,1024,768\" on p2_1"));
+        assert!(script_has_multiple_windows(&script));
+    }
+
+    #[test]
+    fn build_restore_script_multi_window_split_tree() {
+        let mut left = captured_surface(2, 1, "/tmp/left");
+        left.pane_index = 1;
+        left.rect = CapturedPaneRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
+        let mut right = captured_surface(2, 1, "/tmp/right");
+        right.pane_index = 2;
+        right.rect = CapturedPaneRect {
+            x: 100,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
+
+        let workspace = CapturedWorkspace {
+            windows: vec![
+                CapturedWindow {
+                    window_index: 1,
+                    frame: WindowFrame::new(0, 0, 100, 100),
+                },
+                CapturedWindow {
+                    window_index: 2,
+                    frame: WindowFrame::new(0, 0, 200, 200),
+                },
+            ],
+            surfaces: vec![captured_surface(1, 1, "/tmp/one"), left, right],
+        };
+        let script = build_restore_script(&workspace).unwrap();
+
+        // Window 2's tab has two side-by-side panes: anchor split to the right.
+        assert!(script.contains("set cfg2_2 to new surface configuration"));
+        assert!(script.contains("set initial working directory of cfg2_2 to \"/tmp/right\""));
+        assert!(script.contains("split p2_1 direction right with configuration cfg2_2"));
+    }
+
+    #[test]
+    fn parse_captured_window_frames_reads_rows() {
+        let frames = parse_captured_window_frames("1\t10\t20\t800\t600\n2\t-5\t0\t1024\t768\n");
+        assert_eq!(
+            frames,
+            vec![
+                CapturedWindow {
+                    window_index: 1,
+                    frame: WindowFrame::new(10, 20, 800, 600),
+                },
+                CapturedWindow {
+                    window_index: 2,
+                    frame: WindowFrame::new(-5, 0, 1024, 768),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn script_has_multiple_windows_detection() {
+        assert!(script_has_multiple_windows(
+            "-- gtab: format=2 windows=3\ntell application \"Ghostty\""
+        ));
+        assert!(!script_has_multiple_windows(
+            "-- gtab: format=2 windows=1\ntell application \"Ghostty\""
+        ));
+        assert!(!script_has_multiple_windows(
+            "tell application \"Ghostty\"\n    activate"
+        ));
     }
 
     #[test]

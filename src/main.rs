@@ -46,8 +46,12 @@ fn run() -> Result<()> {
             println!("{}", format_workspace_list(&workspaces));
             Ok(())
         }
-        (Some(Commands::Save { name }), None) => {
-            let path = env.save_current_window(&name)?;
+        (Some(Commands::Save { name, all }), None) => {
+            let path = if all {
+                env.save_all_windows(&name)?
+            } else {
+                env.save_current_window(&name)?
+            };
             println!("Saved workspace \"{name}\"");
             println!("  {}", path.display());
             Ok(())

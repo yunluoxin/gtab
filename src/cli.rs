@@ -30,7 +30,13 @@ pub enum Commands {
     /// List saved workspaces.
     List,
     /// Save the current Ghostty window as a workspace.
-    Save { name: String },
+    Save {
+        name: String,
+        /// Save all open Ghostty windows (with their frames) instead of only
+        /// the front window.
+        #[arg(long)]
+        all: bool,
+    },
     /// Edit a workspace AppleScript file in $EDITOR.
     Edit { name: String },
     /// Rename a workspace.
