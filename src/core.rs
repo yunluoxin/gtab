@@ -1099,6 +1099,8 @@ fn capture_workspace_script() -> Result<String> {
         r#"set D to (ASCII character 9)
 tell application "Ghostty"
   set win to front window
+  -- remember the terminal that invoked the capture so focus can be restored
+  set callerId to id of focused terminal of selected tab of front window
 end tell
 tell application "System Events"
   tell process "Ghostty"
@@ -1158,6 +1160,22 @@ tell application "System Events"
   end tell
 end tell
 tell application "Ghostty"
+  -- belt-and-suspenders: also ask Ghostty to focus the caller's terminal;
+  -- AX restore alone fails when a multi-pane tab's `focus` calls switched
+  -- the selected tab away from the caller's tab during capture
+  try
+    set focusDone to false
+    repeat with tb in tabs of win
+      repeat with tm in (every terminal of tb)
+        if (id of tm) is callerId then
+          focus tm
+          set focusDone to true
+          exit repeat
+        end if
+      end repeat
+      if focusDone then exit repeat
+    end repeat
+  end try
   set AppleScript's text item delimiters to linefeed
   return allLines as text
 end tell"#,
