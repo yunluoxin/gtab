@@ -4,7 +4,8 @@
 #   ./scripts/release.sh 1.9.0      # release an explicit version
 #
 # Steps: bump Cargo.toml version -> commit -> tag -> push code+tag ->
-# regenerate the homebrew formula -> commit+push the tap repo.
+# wait for the GitHub Actions release build -> regenerate the bottle formula
+# (downloads the built tarballs' sha256) -> commit+push the tap repo.
 # Other machines then just run: brew upgrade gtab
 set -euo pipefail
 
@@ -61,13 +62,41 @@ cargo update -p gtab --quiet
 # 2. verify it still builds and tests pass
 cargo test --quiet
 
-# 3. commit + tag + push code
+# 3. commit + tag + push code (pushing the tag triggers the release workflow)
 git add Cargo.toml Cargo.lock
 git commit -m "chore: bump version to ${version}"
 git tag "v${version}"
 git push "$CODE_REMOTE" main "v${version}"
 
-# 4. regenerate formula into the tap repo and push
+# 4. wait for the GitHub Actions release build to publish the tarballs
+if ! command -v gh >/dev/null 2>&1; then
+  echo "gh CLI is required to watch the release workflow" >&2
+  exit 1
+fi
+
+echo "Waiting for the release workflow on yunluoxin/gtab..."
+run_id=""
+for _ in $(seq 1 24); do
+  run_id="$(gh run list --repo yunluoxin/gtab --workflow release.yml \
+    --branch "v${version}" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+  [[ -n "$run_id" ]] && break
+  sleep 5
+done
+
+if [[ -z "$run_id" ]]; then
+  echo "could not find the release workflow run for v${version}" >&2
+  echo "check https://github.com/yunluoxin/gtab/actions and re-run the formula step manually:" >&2
+  echo "  ./scripts/render-homebrew-formula.sh \"$TAP_DIR/Formula/gtab.rb\"" >&2
+  exit 1
+fi
+
+if ! gh run watch "$run_id" --repo yunluoxin/gtab --exit-status --interval 15 >/dev/null; then
+  echo "release workflow failed for v${version}" >&2
+  echo "see: https://github.com/yunluoxin/gtab/actions/runs/${run_id}" >&2
+  exit 1
+fi
+
+# 5. regenerate the bottle formula into the tap repo and push
 ./scripts/render-homebrew-formula.sh "$TAP_DIR/Formula/gtab.rb"
 git -C "$TAP_DIR" add Formula/gtab.rb
 if git -C "$TAP_DIR" diff --cached --quiet; then
@@ -78,5 +107,5 @@ else
 fi
 
 echo
-echo "Released v${version}."
+echo "Released v${version} (bottles published by GitHub Actions)."
 echo "Other machines: brew upgrade gtab"

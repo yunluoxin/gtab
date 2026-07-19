@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Regenerate the homebrew formula for the current Cargo.toml version.
+#
+# Bottle mode (default): downloads the GitHub Actions release tarballs for
+# the tag and embeds their sha256, so client machines install prebuilt
+# binaries without a Rust toolchain. Requires the release workflow to have
+# published assets for the tag first.
+#
+# Source mode: RENDER_SOURCE=1 ./scripts/render-homebrew-formula.sh
+# falls back to building from the git tag on the client machine.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,6 +18,8 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
+REPO="yunluoxin/gtab"
+
 version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
 if [[ -z "$version" ]]; then
   echo "failed to read package version from Cargo.toml" >&2
@@ -16,25 +27,10 @@ if [[ -z "$version" ]]; then
 fi
 
 output="${1:-Formula/gtab.rb}"
-
 mkdir -p "$(dirname "$output")"
 
-cat > "$output" <<EOF
-class Gtab < Formula
-  desc "Ghostty tab workspace manager with an interactive TUI"
-  homepage "https://github.com/yunluoxin/gtab"
-  url "https://github.com/yunluoxin/gtab.git",
-      tag: "v${version}"
-  version "${version}"
-  license "MIT"
-  head "https://github.com/yunluoxin/gtab.git", branch: "main"
-
-  depends_on :macos
-  depends_on "rust" => :build
-
-  def install
-    system "cargo", "install", *std_cargo_args
-  end
+caveats_and_test() {
+  cat <<'EOF'
 
   def caveats
     <<~EOS
@@ -69,5 +65,75 @@ class Gtab < Formula
   end
 end
 EOF
+}
 
-echo "Wrote ${output} for v${version}"
+if [[ "${RENDER_SOURCE:-0}" == "1" ]]; then
+  cat > "$output" <<EOF
+class Gtab < Formula
+  desc "Ghostty tab workspace manager with an interactive TUI"
+  homepage "https://github.com/${REPO}"
+  url "https://github.com/${REPO}.git",
+      tag: "v${version}"
+  version "${version}"
+  license "MIT"
+  head "https://github.com/${REPO}.git", branch: "main"
+
+  depends_on :macos
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args
+  end
+$(caveats_and_test)
+EOF
+  echo "Wrote ${output} for v${version} (source build)"
+  exit 0
+fi
+
+# Bottle mode: fetch sha256 for each released tarball.
+fetch_sha() {
+  local target="$1"
+  local url="https://github.com/${REPO}/releases/download/v${version}/gtab-${version}-${target}.tar.gz.sha256"
+  local sha
+  if ! sha="$(curl -fsSL "$url" | awk '{print $1}')"; then
+    echo "failed to fetch ${url}" >&2
+    echo "has the release workflow published v${version} assets yet?" >&2
+    exit 1
+  fi
+  if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "unexpected sha256 content from ${url}: ${sha}" >&2
+    exit 1
+  fi
+  printf '%s' "$sha"
+}
+
+arm_sha="$(fetch_sha aarch64-apple-darwin)"
+intel_sha="$(fetch_sha x86_64-apple-darwin)"
+
+cat > "$output" <<EOF
+class Gtab < Formula
+  desc "Ghostty tab workspace manager with an interactive TUI"
+  homepage "https://github.com/${REPO}"
+  version "${version}"
+  license "MIT"
+  head "https://github.com/${REPO}.git", branch: "main"
+
+  on_arm do
+    url "https://github.com/${REPO}/releases/download/v${version}/gtab-${version}-aarch64-apple-darwin.tar.gz"
+    sha256 "${arm_sha}"
+  end
+
+  on_intel do
+    url "https://github.com/${REPO}/releases/download/v${version}/gtab-${version}-x86_64-apple-darwin.tar.gz"
+    sha256 "${intel_sha}"
+  end
+
+  depends_on :macos
+
+  def install
+    bin.install "gtab"
+  end
+$(caveats_and_test)
+EOF
+
+echo "Wrote ${output} for v${version} (bottle: arm=${arm_sha:0:12}... intel=${intel_sha:0:12}...)"
