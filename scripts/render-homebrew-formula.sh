@@ -22,12 +22,12 @@ mkdir -p "$(dirname "$output")"
 cat > "$output" <<EOF
 class Gtab < Formula
   desc "Ghostty tab workspace manager with an interactive TUI"
-  homepage "https://github.com/Franvy/gtab"
-  url "https://github.com/Franvy/gtab.git",
+  homepage "https://github.com/yunluoxin/gtab"
+  url "https://github.com/yunluoxin/gtab.git",
       tag: "v${version}"
   version "${version}"
   license "MIT"
-  head "https://github.com/Franvy/gtab.git", branch: "main"
+  head "https://github.com/yunluoxin/gtab.git", branch: "main"
 
   depends_on :macos
   depends_on "rust" => :build
