@@ -90,13 +90,22 @@ EOF
   exit 0
 fi
 
-# Bottle mode: fetch sha256 for each released tarball.
+# Bottle mode: fetch sha256 for each released tarball. GitHub attaches
+# release assets asynchronously after the workflow reports success, so retry
+# on 404/empty responses instead of racing the upload.
 fetch_sha() {
   local target="$1"
   local url="https://github.com/${REPO}/releases/download/v${version}/gtab-${version}-${target}.tar.gz.sha256"
-  local sha
-  if ! sha="$(curl -fsSL "$url" | awk '{print $1}')"; then
-    echo "failed to fetch ${url}" >&2
+  local sha="" attempt
+  for attempt in $(seq 1 12); do
+    if sha="$(curl -fsSL "$url" 2>/dev/null | awk '{print $1}')" && [[ -n "$sha" ]]; then
+      break
+    fi
+    sha=""
+    [[ "$attempt" -lt 12 ]] && sleep 10
+  done
+  if [[ -z "$sha" ]]; then
+    echo "failed to fetch ${url} after 12 attempts" >&2
     echo "has the release workflow published v${version} assets yet?" >&2
     exit 1
   fi

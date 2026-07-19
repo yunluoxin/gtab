@@ -7,12 +7,16 @@
 # wait for the GitHub Actions release build -> regenerate the bottle formula
 # (downloads the built tarballs' sha256) -> commit+push the tap repo.
 # Other machines then just run: brew upgrade gtab
+#
+# Idempotent: if a previous run failed partway (e.g. after the tag was pushed
+# but before the formula was updated), re-run with the same version and it
+# resumes after the last completed step.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CODE_REMOTE="${GTAB_CODE_REMOTE:-myfork}"
+CODE_REMOTE="${GTAB_CODE_REMOTE:-origin}"
 TAP_DIR="${GTAB_TAP_DIR:-$(brew --repo yunluoxin/gtab 2>/dev/null || true)}"
 
 if [[ ! -d "$TAP_DIR/.git" ]]; then
@@ -38,34 +42,42 @@ else
   version="${major}.${minor}.$((patch + 1))"
 fi
 
-if [[ "$version" == "$current" ]]; then
-  echo "version $version equals current Cargo.toml version; nothing to do" >&2
-  exit 1
-fi
-
 if git rev-parse "v${version}" >/dev/null 2>&1; then
-  echo "tag v${version} already exists" >&2
-  exit 1
+  # Tag already exists locally: a previous run pushed the bump commit, so
+  # resume at the workflow/formula steps instead of failing.
+  if [[ "$current" != "$version" ]]; then
+    echo "tag v${version} exists but Cargo.toml is at ${current}; resolve manually" >&2
+    exit 1
+  fi
+  echo "v${version} already bumped and tagged; resuming release steps"
+else
+  if [[ "$version" == "$current" ]]; then
+    echo "version $version equals current Cargo.toml version; nothing to do" >&2
+    exit 1
+  fi
+
+  if [[ -n "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]]; then
+    echo "Cargo.toml/Cargo.lock have uncommitted changes; commit or stash first" >&2
+    exit 1
+  fi
+
+  echo "Releasing v${version} (current: v${current})"
+
+  # 1. bump version
+  sed -i '' "s/^version = \"${current}\"/version = \"${version}\"/" Cargo.toml
+  cargo update -p gtab --quiet
+
+  # 2. verify it still builds and tests pass
+  cargo test --quiet
+
+  # 3. commit + tag
+  git add Cargo.toml Cargo.lock
+  git commit -m "chore: bump version to ${version}"
+  git tag "v${version}"
 fi
 
-if [[ -n "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]]; then
-  echo "Cargo.toml/Cargo.lock have uncommitted changes; commit or stash first" >&2
-  exit 1
-fi
-
-echo "Releasing v${version} (current: v${current})"
-
-# 1. bump version
-sed -i '' "s/^version = \"${current}\"/version = \"${version}\"/" Cargo.toml
-cargo update -p gtab --quiet
-
-# 2. verify it still builds and tests pass
-cargo test --quiet
-
-# 3. commit + tag + push code (pushing the tag triggers the release workflow)
-git add Cargo.toml Cargo.lock
-git commit -m "chore: bump version to ${version}"
-git tag "v${version}"
+# push code + tag (pushing the tag triggers the release workflow); no-op if
+# a previous run already pushed them
 git push "$CODE_REMOTE" main "v${version}"
 
 # 4. wait for the GitHub Actions release build to publish the tarballs
