@@ -1201,10 +1201,18 @@ tell application "System Events"
     set callerEl to value of attribute "AXFocusedUIElement"
   end tell
 end tell
+-- Snapshot stable window identities up front. Fronting a window reorders
+-- Ghostty's `windows` list (frontmost becomes window 1), so resolving
+-- `window wi` mid-loop after raises can read back the same window twice;
+-- `window id <tab-group-...>` references are immune to the reordering.
+tell application "Ghostty"
+  set winIds to id of every window
+end tell
 repeat with wi from 1 to winCount
   tell application "Ghostty"
     activate
-    set selName to name of selected tab of window wi
+    set win to window id (item wi of winIds)
+    set selName to name of selected tab of win
   end tell
   tell application "System Events"
     tell process "Ghostty"
@@ -1237,7 +1245,7 @@ repeat with wi from 1 to winCount
     end tell
   end tell
   tell application "Ghostty"
-    set win to window wi
+    set win to window id (item wi of winIds)
     set tabList to tabs of win
     repeat with ti from 1 to count of tabList
       set t to item ti of tabList
