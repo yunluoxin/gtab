@@ -31,6 +31,8 @@ const DOUBLE_CLICK_MS: u64 = 350;
 const MIN_WIDTH: u16 = 52;
 const MIN_HEIGHT: u16 = 15;
 const MAIN_LIST_WIDTH: u16 = 24;
+/// Rows each workspace entry occupies in the list (name line + summary line).
+const WORKSPACE_ITEM_HEIGHT: u16 = 2;
 const DIRECTORY_CELL_MIN_WIDTH: u16 = 14;
 const DIRECTORY_CELL_MAX_WIDTH: u16 = 26;
 const DIRECTORY_CELL_GAP: u16 = 2;
@@ -690,7 +692,10 @@ impl App {
 
     fn page_step(&self) -> isize {
         match self.mode {
-            BrowserMode::Workspace => self.list_area.height.saturating_sub(1).max(5) as isize,
+            BrowserMode::Workspace => (self.list_area.height as isize
+                / WORKSPACE_ITEM_HEIGHT as isize)
+                .saturating_sub(1)
+                .max(5),
             BrowserMode::Directory => {
                 let metrics = self.directory_grid_metrics();
                 (metrics.columns.saturating_mul(metrics.rows_per_page.max(1))) as isize
@@ -1401,7 +1406,7 @@ impl App {
         }
 
         let relative_row = row.saturating_sub(self.list_area.y) as usize;
-        let index = self.list_offset + relative_row;
+        let index = self.list_offset + relative_row / WORKSPACE_ITEM_HEIGHT as usize;
         (index < self.visible_indices().len()).then_some(index)
     }
 
@@ -1677,10 +1682,16 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         visible
             .iter()
             .map(|workspace| {
-                ListItem::new(Span::styled(
-                    format!("[{}]", workspace.name),
-                    theme.emphasis,
-                ))
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        format!("[{}]", workspace.name),
+                        theme.emphasis,
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {}", workspace_summary(workspace)),
+                        theme.dim,
+                    )),
+                ])
             })
             .collect()
     };
@@ -1693,6 +1704,27 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
 
     frame.render_stateful_widget(list, list_area, &mut state);
     app.list_offset = state.offset();
+}
+
+/// Summary line shown under each workspace name in the list: window and tab
+/// counts for multi-window workspaces, just the tab count otherwise.
+fn workspace_summary(workspace: &Workspace) -> String {
+    let tab_count = if !workspace.windows.is_empty() {
+        workspace.windows.iter().map(Vec::len).sum()
+    } else if !workspace.layout.is_empty() {
+        workspace.layout.len()
+    } else {
+        workspace.tabs.len()
+    };
+
+    let tabs = if tab_count == 1 { "tab" } else { "tabs" };
+    if !workspace.windows.is_empty() {
+        let window_count = workspace.windows.len();
+        let windows = if window_count == 1 { "window" } else { "windows" };
+        format!("{window_count} {windows} · {tab_count} {tabs}")
+    } else {
+        format!("{tab_count} {tabs}")
+    }
 }
 
 fn draw_directory_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
@@ -2860,16 +2892,38 @@ mod tests {
         let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.list_area = Rect::new(0, 0, 40, 6);
 
+        // Each workspace entry is two rows tall: row 2 is inside the second
+        // entry ("beta").
         assert_eq!(
-            app.handle_mouse(left_click(1, 1), &env()).unwrap(),
+            app.handle_mouse(left_click(1, 2), &env()).unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 1);
 
         assert_eq!(
-            app.handle_mouse(left_click(1, 1), &env()).unwrap(),
+            app.handle_mouse(left_click(1, 2), &env()).unwrap(),
             Action::LaunchWorkspace("beta".to_string())
         );
+    }
+
+    #[test]
+    fn click_on_summary_row_selects_same_workspace() {
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
+        app.list_area = Rect::new(0, 0, 40, 6);
+
+        // Row 3 is the summary line of the second entry.
+        assert_eq!(
+            app.handle_mouse(left_click(1, 3), &env()).unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 1);
+
+        // Row 0 is the first entry's name line.
+        assert_eq!(
+            app.handle_mouse(left_click(1, 0), &env()).unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
@@ -3427,6 +3481,57 @@ mod tests {
 
         assert!(lines.iter().any(|line| line.contains("main")));
         assert!(!lines.iter().any(|line| line.contains("Window")));
+    }
+
+    #[test]
+    fn workspace_summary_counts_windows_and_tabs() {
+        let mut ws = workspace("multi");
+        ws.windows = vec![
+            vec![WorkspaceTabLayout {
+                title: "a".to_string(),
+                root: WorkspacePaneLayout::Leaf {
+                    working_dir: "/tmp/a".to_string(),
+                },
+            }],
+            vec![
+                WorkspaceTabLayout {
+                    title: "b".to_string(),
+                    root: WorkspacePaneLayout::Leaf {
+                        working_dir: "/tmp/b".to_string(),
+                    },
+                },
+                WorkspaceTabLayout {
+                    title: "c".to_string(),
+                    root: WorkspacePaneLayout::Leaf {
+                        working_dir: "/tmp/c".to_string(),
+                    },
+                },
+            ],
+        ];
+        assert_eq!(workspace_summary(&ws), "2 windows · 3 tabs");
+
+        let mut single = workspace("single");
+        single.layout = vec![WorkspaceTabLayout {
+            title: "only".to_string(),
+            root: WorkspacePaneLayout::Leaf {
+                working_dir: "/tmp/x".to_string(),
+            },
+        }];
+        assert_eq!(workspace_summary(&single), "1 tab");
+
+        // Legacy workspace with no layout data falls back to the tab list.
+        let mut legacy = workspace("legacy");
+        legacy.tabs = vec![
+            WorkspaceTab {
+                title: "x".to_string(),
+                working_dir: None,
+            },
+            WorkspaceTab {
+                title: "y".to_string(),
+                working_dir: None,
+            },
+        ];
+        assert_eq!(workspace_summary(&legacy), "2 tabs");
     }
 
     #[test]
