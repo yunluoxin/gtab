@@ -33,6 +33,11 @@ The following scenarios still require manual verification on macOS with Ghostty:
 4. Launch from the TUI and confirm window frame sync works when Accessibility permissions are granted.
 5. Run `gtab init` and `gtab set ghostty_shortcut ...` against a normal writable Ghostty config.
 6. Repeat shortcut setup against a Nix/Home Manager or otherwise externally managed Ghostty config and confirm the manual-setup messaging is correct.
+7. With two or more Ghostty windows open, run `gtab save <name> --all` and confirm:
+   - each window is briefly fronted during capture and focus returns to the invoking terminal afterward,
+   - the saved script starts with `-- gtab: format=2 windows=N` and contains one `new window` + `set_frame` per window,
+   - launching recreates every window with its tabs, splits, working directories, and frame.
+8. With exactly one window open, `gtab save <name> --all` must produce the same single-window script shape as `gtab save` (legacy `cfg1`, `win` variables, no `set_frame`).
 
 ## Notes
 

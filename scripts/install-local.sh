@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build gtab from this source tree and install it over the Homebrew binary
-# via a symlink, so iterating locally is just: ./install-local.sh
+# via a symlink, so iterating locally is just: ./scripts/install-local.sh
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 cargo build --release
 

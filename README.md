@@ -1,5 +1,7 @@
 # gtab
 
+> Personal fork of [Franvy/gtab](https://github.com/Franvy/gtab), adding multi-window workspace save/restore (`gtab save --all`) and prebuilt Homebrew bottles.
+
 `gtab` is a lightweight workspace manager for [Ghostty](https://ghostty.org) on macOS.
 
 Save your current Ghostty window layout as a named workspace. Reopen it later with a single keystroke. That is the whole idea.
@@ -11,7 +13,8 @@ Save your current Ghostty window layout as a named workspace. Reopen it later wi
 ## Quick Install
 
 ```bash
-brew tap Franvy/gtab
+brew tap yunluoxin/gtab
+brew trust yunluoxin/gtab   # one-time: allow this third-party tap
 brew install gtab
 gtab init
 ```
@@ -23,7 +26,8 @@ Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghos
 ## What It Does
 
 - Save a Ghostty window as a named workspace — tabs, working directories, titles, and split panes
-- Reopen any workspace later as a fresh Ghostty window with native tabs
+- Save **all** open Ghostty windows (with their positions and sizes) as one workspace via `gtab save --all`
+- Reopen any workspace later as fresh Ghostty windows with native tabs
 - Save named directory entries and reopen the current split as a fresh shell in that directory
 - Launch from a small keyboard-first TUI, or directly from the shell
 - New window automatically aligns to your current Ghostty window position and size
@@ -144,13 +148,26 @@ Directory entries are stored as plain `.path` files in `~/.config/gtab/dirs/`.
 
 ### Homebrew (recommended)
 
+Prebuilt binaries for Apple Silicon and Intel are published by GitHub Actions — no Rust toolchain needed on the machine installing gtab.
+
 ```bash
-brew tap Franvy/gtab
+brew tap yunluoxin/gtab
+brew trust yunluoxin/gtab   # one-time: allow this third-party tap
 brew install gtab
 gtab init
 ```
 
 Reload Ghostty config or restart Ghostty. Then press `Cmd+G` inside any Ghostty shell.
+
+### Local development install
+
+After changing the source, build and symlink over the Homebrew binary in one step:
+
+```bash
+./scripts/install-local.sh
+```
+
+Note this symlink is replaced the next time you `brew upgrade gtab` / `brew reinstall gtab`, and vice versa.
 
 ### Build from source
 
@@ -165,6 +182,26 @@ gtab init
 
 ```bash
 brew upgrade gtab
+```
+
+### Releasing (maintainer)
+
+One command bumps the version, runs tests, tags, pushes, waits for the GitHub Actions build, and updates the tap formula:
+
+```bash
+./scripts/release.sh          # bump patch (1.8.0 -> 1.8.1) and release
+./scripts/release.sh 1.9.0    # release an explicit version
+```
+
+Pushing the tag triggers `.github/workflows/release.yml`, which builds `aarch64-apple-darwin` and `x86_64-apple-darwin` tarballs and attaches them (with sha256) to the GitHub release. The script then regenerates the bottle formula in the tap repo (`yunluoxin/homebrew-gtab`) with those checksums.
+
+If the CI build is unavailable, fall back to a source-build formula (clients then compile with their own Rust toolchain):
+
+```bash
+git tag v1.8.1 && git push myfork main v1.8.1
+RENDER_SOURCE=1 ./scripts/render-homebrew-formula.sh "$(brew --repo yunluoxin/gtab)/Formula/gtab.rb"
+git -C "$(brew --repo yunluoxin/gtab)" commit -am "release v1.8.1 (source build)"
+git -C "$(brew --repo yunluoxin/gtab)" push
 ```
 
 ---
@@ -249,6 +286,10 @@ Nix/Home Manager usually generates Ghostty config from a declaration source inst
 ### Does gtab support split panes?
 
 Yes, as of v1.4.1. `gtab save` captures split pane layouts. Splits are restored when launching.
+
+### Does gtab support multiple windows?
+
+Yes, as of v1.8.0. `gtab save <name> --all` captures every open Ghostty window (tabs, splits, working directories, titles, and each window's position and size) into one workspace. Launching recreates all windows and restores each window's frame. Each window is briefly brought to the front during capture, and focus returns to the terminal that ran the command when done. With only one window open, `--all` behaves exactly like a plain `gtab save`.
 
 ---
 
