@@ -1090,6 +1090,15 @@ fn capture_workspace_script() -> Result<String> {
         r#"set D to (ASCII character 9)
 tell application "Ghostty"
   set win to front window
+end tell
+tell application "System Events"
+  tell process "Ghostty"
+    -- grab the AX element of the caller's surface; restoring AXFocused on it
+    -- at the end moves keyboard focus back without injecting any characters
+    set callerEl to value of attribute "AXFocusedUIElement"
+  end tell
+end tell
+tell application "Ghostty"
   set tabList to tabs of win
   set allLines to {}
   repeat with ti from 1 to count of tabList
@@ -1126,6 +1135,20 @@ tell application "Ghostty"
       end repeat
     end if
   end repeat
+end tell
+tell application "System Events"
+  tell process "Ghostty"
+    -- restore keyboard focus to the caller's surface directly via the
+    -- Accessibility API; this moves focus without injecting characters
+    -- (Ghostty's "focus" verb alone doesn't switch split-pane surfaces)
+    try
+      if callerEl is not missing value then
+        set value of attribute "AXFocused" of callerEl to true
+      end if
+    end try
+  end tell
+end tell
+tell application "Ghostty"
   set AppleScript's text item delimiters to linefeed
   return allLines as text
 end tell"#,
@@ -1173,6 +1196,9 @@ end tell
 tell application "System Events"
   tell process "Ghostty"
     set prevWin to value of attribute "AXMainWindow"
+    -- grab the AX element of the caller's surface; restoring AXFocused on it
+    -- at the end moves keyboard focus back without injecting any characters
+    set callerEl to value of attribute "AXFocusedUIElement"
   end tell
 end tell
 repeat with wi from 1 to winCount
@@ -1258,8 +1284,21 @@ tell application "System Events"
     end try
   end tell
 end tell
+tell application "System Events"
+  tell process "Ghostty"
+    -- restore keyboard focus to the caller's surface directly via the
+    -- Accessibility API; this moves focus without injecting characters
+    -- (Ghostty's "focus" verb alone doesn't switch split-pane surfaces)
+    try
+      if callerEl is not missing value then
+        set value of attribute "AXFocused" of callerEl to true
+      end if
+    end try
+  end tell
+end tell
 tell application "Ghostty"
-  -- return focus to the terminal that invoked the capture
+  -- belt-and-suspenders: also ask Ghostty to focus the caller's terminal so
+  -- its window comes to the front (handles cross-window cases)
   try
     set focusDone to false
     repeat with w in windows
