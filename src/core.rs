@@ -4,7 +4,7 @@ use std::ffi::{CStr, c_void};
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -130,7 +130,7 @@ pub struct WindowFrame {
 }
 
 impl WindowFrame {
-    fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self {
             x,
             y,
@@ -177,54 +177,11 @@ enum WorkspaceLaunchMode {
     DirectFallback,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CapturedTabSurface {
-    /// 1-based Ghostty window index. Always 1 for single-window captures.
-    window_index: usize,
-    tab_index: usize,
-    pane_index: usize,
-    terminal_id: String,
-    working_dir: String,
-    title: String,
-    rect: CapturedPaneRect,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CapturedPaneRect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CapturedWindow {
-    /// 1-based index matching `CapturedTabSurface::window_index`.
-    window_index: usize,
-    frame: WindowFrame,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CapturedWorkspace {
-    windows: Vec<CapturedWindow>,
-    surfaces: Vec<CapturedTabSurface>,
-}
-
-impl CapturedWorkspace {
-    fn single_window(surfaces: Vec<CapturedTabSurface>) -> Self {
-        Self {
-            windows: vec![CapturedWindow {
-                window_index: 1,
-                frame: WindowFrame::new(0, 0, 0, 0),
-            }],
-            surfaces,
-        }
-    }
-
-    fn is_multi_window(&self) -> bool {
-        self.windows.len() > 1
-    }
-}
+// Capture-model types live in `restore_script` (the module that consumes
+// them); re-exported here so existing `core::` paths keep working.
+pub(crate) use crate::restore_script::{
+    CapturedPaneRect, CapturedTabSurface, CapturedWindow, CapturedWorkspace,
+};
 
 impl AppEnv {
     pub fn load() -> Result<Self> {
@@ -1186,10 +1143,11 @@ end tell"#,
         bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
 
-    let captured = parse_captured_tab_surfaces(&raw, 1);
+    let mut captured = parse_captured_tab_surfaces(&raw, 1);
     if captured.is_empty() {
         bail!("could not parse Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
+    suppress_shell_default_titles(&mut captured);
 
     build_restore_script(&CapturedWorkspace::single_window(captured))
 }
@@ -1387,6 +1345,7 @@ return frameText & linefeed & "@@SURFACES@@" & linefeed & rowText"#,
     if captured.is_empty() {
         bail!("could not parse Ghostty tabs (make sure Ghostty is running)");
     }
+    suppress_shell_default_titles(&mut captured);
 
     build_restore_script(&CapturedWorkspace {
         windows,
@@ -1419,179 +1378,26 @@ fn parse_captured_window_frames(section: &str) -> Vec<CapturedWindow> {
 /// per-window `cfgW_T` indexes, one window variable per window, and restore
 /// each window's frame through Ghostty's `set_frame` action.
 fn build_restore_script(workspace: &CapturedWorkspace) -> Result<String> {
-    let normalized = serialize_captured_tab_surfaces(&workspace.surfaces);
-    let multi = workspace.is_multi_window();
-    let frames: Vec<(usize, i32, i32, i32, i32)> = workspace
-        .windows
-        .iter()
-        .map(|window| {
-            (
-                window.window_index,
-                window.frame.x,
-                window.frame.y,
-                window.frame.width,
-                window.frame.height,
-            )
-        })
-        .collect();
-
-    // Phase 2: reconstruct split trees from positions and generate restore script
-    let py = r#"import sys
-from collections import defaultdict
-
-MULTI = __MULTI__
-FRAMES = {wi: (x, y, w, h) for wi, x, y, w, h in __FRAMES__}
-
-def esc(s):
-    return s.replace('\\', '\\\\').replace('"', '\\"')
-
-def get_anchor(tree):
-    if tree['t'] == 'leaf': return tree['p']
-    if tree['t'] == 'v':    return get_anchor(tree['l'])
-    return get_anchor(tree['T'])
-
-def reconstruct(panes):
-    if len(panes) == 1:
-        return {'t': 'leaf', 'p': panes[0]}
-    for sx in sorted(set(p['x'] + p['w'] for p in panes)):
-        L = [p for p in panes if p['x'] + p['w'] <= sx + 2]
-        R = [p for p in panes if p['x'] >= sx - 2]
-        if L and R and len(L) + len(R) == len(panes):
-            return {'t': 'v', 'l': reconstruct(L), 'r': reconstruct(R)}
-    for sy in sorted(set(p['y'] + p['h'] for p in panes)):
-        T = [p for p in panes if p['y'] + p['h'] <= sy + 2]
-        B = [p for p in panes if p['y'] >= sy - 2]
-        if T and B and len(T) + len(B) == len(panes):
-            return {'t': 'h', 'T': reconstruct(T), 'B': reconstruct(B)}
-    return {'t': 'leaf', 'p': panes[0]}
-
-def gen(tree, var, lines, cv, c):
-    if tree['t'] == 'leaf': return cv, c
-    # Single-window workspaces keep legacy `cfg{c}` variable names so the
-    # launch/parse logic built for pre---all scripts keeps working.
-    pfx = f"{cv}_" if MULTI else ""
-    if tree['t'] == 'v':
-        a = get_anchor(tree['r'])
-        cfg = f"cfg{pfx}{c}"
-        lines += [
-            '',
-            f"    set {cfg} to new surface configuration",
-            f'    set initial working directory of {cfg} to "{esc(a["wd"])}"',
-            f"    set p{pfx}{c} to split {var} direction right with configuration {cfg}"
-        ]
-        rv, c = f"p{pfx}{c}", c + 1
-        cv, c = gen(tree['l'], var, lines, cv, c)
-        cv, c = gen(tree['r'], rv, lines, cv, c)
-    else:
-        a = get_anchor(tree['B'])
-        cfg = f"cfg{pfx}{c}"
-        lines += [
-            '',
-            f"    set {cfg} to new surface configuration",
-            f'    set initial working directory of {cfg} to "{esc(a["wd"])}"',
-            f"    set p{pfx}{c} to split {var} direction down with configuration {cfg}"
-        ]
-        bv, c = f"p{pfx}{c}", c + 1
-        cv, c = gen(tree['T'], var, lines, cv, c)
-        cv, c = gen(tree['B'], bv, lines, cv, c)
-    return cv, c
-
-windows = defaultdict(lambda: defaultdict(lambda: {'title': '', 'panes': []}))
-for line in sys.stdin:
-    parts = line.rstrip('\n').split('\t')
-    if len(parts) < 7: continue
-    try: wi, ti = int(parts[0]), int(parts[1])
-    except ValueError: continue
-    wd, title, pos = parts[4], parts[5], parts[6]
-    try: x, y, w, h = map(int, pos.split(','))
-    except ValueError: x, y, w, h = 0, 0, 1, 1
-    windows[wi][ti]['title'] = title
-    windows[wi][ti]['panes'].append({'x': x, 'y': y, 'w': w, 'h': h, 'wd': wd})
-
-out = ['tell application "Ghostty"', '    activate']
-for wi in sorted(windows.keys()):
-    tabs = windows[wi]
-    cv = wi if MULTI else 1
-    wv = f"win{wi}" if MULTI else "win"
-    pfx = f"{cv}_" if MULTI else ""
-    c = 1
-    for i, ti in enumerate(sorted(tabs.keys())):
-        tab = tabs[ti]
-        tree = reconstruct(tab['panes'])
-        anchor = get_anchor(tree)
-        cfg = f"cfg{pfx}{c}"
-        out += [
-            '',
-            f"    set {cfg} to new surface configuration",
-            f'    set initial working directory of {cfg} to "{esc(anchor["wd"])}"'
-        ]
-        if i == 0:
-            out += [
-                f"    set {wv} to new window with configuration {cfg}",
-                f"    set p{pfx}{c} to focused terminal of selected tab of {wv}"
-            ]
-        else:
-            out += [
-                f"    set newtab{cv}_{i} to new tab in {wv} with configuration {cfg}",
-                f"    set p{pfx}{c} to focused terminal of newtab{cv}_{i}"
-            ]
-        fv, c = f"p{pfx}{c}", c + 1
-        if tab['title']:
-            out.append(f'    perform action "set_tab_title:{esc(tab["title"])}" on {fv}')
-        cv, c = gen(tree, fv, out, cv, c)
-    if MULTI and wi in FRAMES:
-        fx, fy, fw, fh = FRAMES[wi]
-        # set_frame needs a terminal target (a window target errors with
-        # "Missing terminal target"); the first pane of the window works.
-        out += [
-            '',
-            f'    perform action "set_frame:{fx},{fy},{fw},{fh}" on p{pfx}1'
-        ]
-
-out.append('end tell')
-header = f"-- gtab: format=2 windows={len(windows)}"
-print(header + '\n' + '\n'.join(out))
-"#;
-
-    let py = py
-        .replace("__MULTI__", if multi { "True" } else { "False" })
-        .replace("__FRAMES__", &format!("{frames:?}"));
-
-    let mut child = Command::new("python3")
-        .arg("-c")
-        .arg(py)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn python3 for workspace script generation")?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open python3 stdin")?;
-        stdin
-            .write_all(normalized.as_bytes())
-            .context("failed to write tab data to python3")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for python3")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to generate workspace script: {stderr}");
-    }
-
-    String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
+    Ok(crate::restore_script::render_restore_script(workspace))
 }
 
 fn parse_captured_tab_surfaces(raw: &str, window_index: usize) -> Vec<CapturedTabSurface> {
     raw.lines()
         .filter_map(|line| parse_captured_tab_surface(line, window_index))
         .collect()
+}
+
+/// Drop shell-generated default titles (e.g. `user@host:~/project`, `zsh`)
+/// from captured surfaces so restore scripts don't freeze a stale title
+/// onto a tab whose shell would have set a fresh one anyway. Custom titles
+/// are kept untouched. Restores the filtering the retired Python generator
+/// applied via `serialize_captured_tab_surfaces`.
+fn suppress_shell_default_titles(surfaces: &mut [CapturedTabSurface]) {
+    for surface in surfaces.iter_mut() {
+        if looks_like_shell_default_title(&surface.title, &surface.working_dir) {
+            surface.title.clear();
+        }
+    }
 }
 
 fn parse_captured_tab_surface(line: &str, window_index: usize) -> Option<CapturedTabSurface> {
@@ -1626,40 +1432,6 @@ fn parse_captured_pane_rect(value: &str) -> Option<CapturedPaneRect> {
         width,
         height,
     })
-}
-
-fn serialize_captured_tab_surfaces(rows: &[CapturedTabSurface]) -> String {
-    let mut out = String::new();
-
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-
-        out.push_str(&row.window_index.to_string());
-        out.push('\t');
-        out.push_str(&row.tab_index.to_string());
-        out.push('\t');
-        out.push_str(&row.pane_index.to_string());
-        out.push('\t');
-        out.push_str(&row.terminal_id);
-        out.push('\t');
-        out.push_str(&row.working_dir);
-        out.push('\t');
-        let title_to_write = if looks_like_shell_default_title(&row.title, &row.working_dir) {
-            ""
-        } else {
-            &row.title
-        };
-        out.push_str(title_to_write);
-        out.push('\t');
-        out.push_str(&format!(
-            "{},{},{},{}",
-            row.rect.x, row.rect.y, row.rect.width, row.rect.height
-        ));
-    }
-
-    out
 }
 
 fn normalize_captured_tab_title(raw: &str) -> String {
@@ -2828,8 +2600,8 @@ mod tests {
         parse_window_frame, parse_workspace_rows, parse_workspace_window_layouts,
         parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
         render_ghostty_include_config_line, render_shell_cd_command, script_has_multiple_windows,
-        should_switch_to_ascii_input_source, sync_ghostty_include_reference,
-        validate_workspace_name, workspace_requires_true_legacy_launch,
+        should_switch_to_ascii_input_source, suppress_shell_default_titles,
+        sync_ghostty_include_reference, validate_workspace_name, workspace_requires_true_legacy_launch,
     };
     use std::{fs, path::PathBuf};
 
@@ -3320,6 +3092,30 @@ end tell
 
         assert!(!script.contains("set_tab_title:fran@host"));
         assert!(script.contains("set_tab_title:operation"));
+    }
+
+    #[test]
+    fn suppress_shell_default_titles_clears_defaults_keeps_custom() {
+        let mut surfaces = vec![
+            CapturedTabSurface {
+                title: "fran@host:~/tmp/project".to_string(),
+                ..captured_surface(1, 1, "/tmp/project")
+            },
+            CapturedTabSurface {
+                title: "zsh".to_string(),
+                ..captured_surface(1, 2, "/tmp/other")
+            },
+            CapturedTabSurface {
+                title: "editor".to_string(),
+                ..captured_surface(1, 3, "/tmp/keep")
+            },
+        ];
+
+        suppress_shell_default_titles(&mut surfaces);
+
+        assert_eq!(surfaces[0].title, "");
+        assert_eq!(surfaces[1].title, "");
+        assert_eq!(surfaces[2].title, "editor");
     }
 
     #[test]
